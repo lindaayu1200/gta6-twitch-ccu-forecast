@@ -1,13 +1,13 @@
-"""Empirical-quantile CCU forecast for game-launch comparables.
+"""Weighted comparable-pool log-ratio quantile forecast for Twitch launch CCU.
 
-We treat the observed hour-1 concurrency as a scale anchor and estimate the
-*shape* of the launch-day decay from a pool of comparable launches.  For every
-pool member we compute the log ratio log(viewers_h / viewers_1) on its own
-release day; the empirical distribution of those log ratios at each hour gives
-a non-parametric quantile curve (no normality assumption).  Neighbouring hours
-are blended to damp sampling noise, and the log quantiles are exponentiated
-back onto the anchor scale.  An empty pool falls back to a Gaussian-shaped
-house baseline with a fixed 0.15-per-sqrt-hour log dispersion.
+Anchors on the observed hour-1 concurrency and models the release-day decay as
+log ratios ln(v_h / v_1) derived from a pool of comparable launches. Comparables
+are filtered for data quality, weighted by unlock-pattern match and size
+similarity to the target, and their weighted empirical log-ratio quantiles form
+a non-parametric profile per hour. Profiles are smoothed across neighbouring
+hours, adjusted around the median with fixed calibration, then exponentiated
+back onto the anchor scale. An empty pool falls back to a Gaussian-shaped house
+baseline.
 """
 
 from __future__ import annotations
@@ -20,240 +20,318 @@ from typing import Any
 
 LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 Z_HOUSE = (-1.6448536, -0.6744897, 0.0, 0.6744897, 1.6448536)
-BAD_NOTES = ("early-access-contaminated", "Tier: weak", "target-history")
-MIN_Q, MAX_Q = 1.0, 1e9
-MIN_ANCHOR_VIEWERS = 50.0
-MIN_COVERED_HOURS = 20
+BAD_MARKERS = ("target-history", "early-access-contaminated", "Tier: weak")
 HOURS = tuple(range(2, 25))
+MIN_Q, MAX_Q = 1.0, 1e9
+MIN_H1 = 50.0
+MIN_COVERED = 20
 
 
 def parse_time(value: Any) -> datetime | None:
-    """Return an aware UTC datetime for an ISO-8601 string, or None."""
-    if not isinstance(value, str) or not value.strip():
+    """Parse an ISO 8601 timestamp into an aware UTC datetime, or None."""
+    if not isinstance(value, str) or not value:
         return None
     text = value.strip()
-    if text[-1:] in ("Z", "z"):
+    if text.endswith(("Z", "z")):
         text = text[:-1] + "+00:00"
     try:
-        stamp = datetime.fromisoformat(text)
+        dt = datetime.fromisoformat(text)
     except (ValueError, TypeError):
         return None
-    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
-def hour_of(day_start: datetime, value: Any) -> int | None:
-    """Map a timestamp to a 1-based release-day hour (whole hours since start)."""
-    stamp = parse_time(value)
-    if stamp is None:
-        return None
-    return int(math.floor((stamp - day_start).total_seconds() / 3600.0)) + 1
-
-
-def finite_number(value: Any) -> float | None:
-    """Coerce a JSON number to a finite float, rejecting bools and nulls."""
+def to_finite(value: Any) -> float | None:
+    """Return a finite float for a numeric value, else None."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     number = float(value)
     return number if math.isfinite(number) else None
 
 
-def empirical_quantile(sorted_values: list[float], tau: float) -> float:
-    """Linearly interpolated empirical quantile (type-7) of sorted values."""
-    if len(sorted_values) == 1:
-        return sorted_values[0]
-    pos = (len(sorted_values) - 1) * min(max(tau, 0.0), 1.0)
-    low = int(math.floor(pos))
-    high = min(low + 1, len(sorted_values) - 1)
-    frac = pos - low
-    return sorted_values[low] * (1.0 - frac) + sorted_values[high] * frac
+def hour_index(day_start: datetime, point_from: Any) -> int | None:
+    """1-based release-day hour index for a point timestamp."""
+    ts = parse_time(point_from)
+    if ts is None:
+        return None
+    delta = (ts - day_start).total_seconds() / 3600.0
+    return int(math.floor(delta)) + 1
 
 
-def anchor_viewers(case: dict[str, Any]) -> float:
-    """Resolve p1 from known hour 1, history hour 1, then the last known point."""
+def get_anchor(case: dict[str, Any]) -> float:
+    """Hour-1 anchor p from known viewers, at least 1."""
     known = case.get("known")
-    known = known if isinstance(known, list) else []
-    for row in known:
-        if isinstance(row, dict) and row.get("hour") == 1:
-            value = finite_number(row.get("viewers"))
-            if value is not None and value >= 1.0:
-                return value
-    history = case.get("history_hourly")
-    history = history if isinstance(history, list) else []
-    day_start = parse_time(case.get("day_start"))
-    for row in history:
-        if not isinstance(row, dict):
-            continue
-        is_hour_one = row.get("hour") == 1 or (
-            day_start is not None and hour_of(day_start, row.get("from")) == 1
-        )
-        if is_hour_one:
-            value = finite_number(row.get("viewers"))
-            if value is not None and value >= 1.0:
-                return value
-    for row in reversed(known):
-        if isinstance(row, dict):
-            value = finite_number(row.get("viewers"))
-            if value is not None and value >= 1.0:
-                return value
+    if isinstance(known, list):
+        for row in known:
+            if not isinstance(row, dict):
+                continue
+            if row.get("hour") == 1:
+                v = to_finite(row.get("viewers"))
+                if v is not None and v > 0.0:
+                    return max(1.0, v)
     return 1.0
 
 
-# Hour 1 is the denominator of every log ratio: a launch anchored by only a
-# handful of viewers (or by noise around zero) produces explosive ratios, so
-# require a real hour-1 print.  Requiring 20 of 24 usable hours stops a largely
-# unobserved day from being padded into a complete-looking curve by the
-# nearest-hour borrow below; each launch still enters the pool at most once
-# per hour, even if its input repeats a timestamp.
-def build_pool(case: dict[str, Any]) -> list[list[float]]:
-    """Collect 24-point release-day viewer curves from eligible comparables."""
-    pool: list[list[float]] = []
+def is_bad_comparable(comp: dict[str, Any]) -> bool:
+    """True if unlock or notes text contains an exclusion marker."""
+    parts: list[str] = []
+    for key in ("unlock", "notes"):
+        val = comp.get(key)
+        if isinstance(val, str):
+            parts.append(val)
+    text = "\n".join(parts)
+    return any(marker in text for marker in BAD_MARKERS)
+
+
+def build_release_curve(comp: dict[str, Any]) -> dict[int, float] | None:
+    """Return hour->viewers map for hours 1..24, or None if unusable."""
+    day_start = parse_time(comp.get("day_start"))
+    hourly = comp.get("hourly")
+    if day_start is None or not isinstance(hourly, list):
+        return None
+    curve: dict[int, float] = {}
+    for point in hourly:
+        if not isinstance(point, dict):
+            continue
+        h = hour_index(day_start, point.get("from"))
+        if h is None or h < 1 or h > 24 or h in curve:
+            continue
+        v = to_finite(point.get("viewers"))
+        if v is not None and v > 0.0:
+            curve[h] = v
+    if len(curve) < MIN_COVERED:
+        return None
+    h1 = curve.get(1)
+    if h1 is None or h1 < MIN_H1:
+        return None
+    return curve
+
+
+class PoolMember:
+    __slots__ = ("curve", "unlock", "weight", "h1")
+
+    def __init__(self, curve: dict[int, float], unlock: str, weight: float):
+        self.curve = curve
+        self.unlock = unlock
+        self.weight = weight
+        self.h1 = curve[1]
+
+
+def build_pool(case: dict[str, Any], anchor: float) -> list[PoolMember]:
+    """Construct weighted comparable pool."""
     comparables = case.get("comparables")
     if not isinstance(comparables, list):
-        return pool
+        return []
+    members: list[PoolMember] = []
     for comp in comparables:
         if not isinstance(comp, dict):
             continue
-        text = " ".join(str(v) for v in comp.values() if isinstance(v, str))
-        if any(marker in text for marker in BAD_NOTES):
+        if is_bad_comparable(comp):
             continue
-        day_start = parse_time(comp.get("day_start"))
-        hourly = comp.get("hourly")
-        if day_start is None or not isinstance(hourly, list):
+        curve = build_release_curve(comp)
+        if curve is None:
             continue
-        values: dict[int, float] = {}
-        for point in hourly:
-            if not isinstance(point, dict):
-                continue
-            hour = hour_of(day_start, point.get("from"))
-            if hour is None or not 1 <= hour <= 24 or hour in values:
-                continue
-            value = finite_number(point.get("viewers"))
-            if value is not None and value > 0.0:
-                values[hour] = value
-        if len(values) < MIN_COVERED_HOURS:
-            continue
-        originals = sorted(values)
-        curve = [
-            values[hour] if hour in values
-            else values[min(originals, key=lambda h: (abs(h - hour), h))]
-            for hour in range(1, 25)
-        ]
-        if curve[0] < MIN_ANCHOR_VIEWERS:
-            continue
-        pool.append(curve)
-    return pool
-
-
-def house_log_shape(hour: int, count: int) -> list[float]:
-    """The house baseline's log shape at one hour, for the first `count` levels."""
-    return [z * 0.15 * math.sqrt(hour - 1) for z in Z_HOUSE[:count]]
-
-
-def log_quantiles(pool: list[list[float]], levels: list[float]) -> dict[int, list[float]]:
-    """Empirical log-ratio quantile arrays for each forecast hour."""
-    result: dict[int, list[float]] = {}
-    for hour in HOURS:
-        ratios: list[float] = []
-        for curve in pool:
-            base, current = curve[0], curve[hour - 1]
-            if base > 0.0 and current > 0.0:
-                ratio = math.log(current / base)
-                if math.isfinite(ratio):
-                    ratios.append(ratio)
-        ratios.sort()
-        result[hour] = (
-            [empirical_quantile(ratios, tau) for tau in levels] if ratios
-            else house_log_shape(hour, len(levels))
-        )
-    return result
-
-
-def smooth(hour: int, raw: dict[int, list[float]], width: int) -> list[float]:
-    """Blend a quantile array with its (clamped) neighbours, weights .5/1/.5."""
-    total = [0.0] * width
-    weight_sum = 0.0
-    for neighbour, weight in ((hour - 1, 0.5), (hour, 1.0), (hour + 1, 0.5)):
-        for index, value in enumerate(raw[min(24, max(2, neighbour))]):
-            total[index] += weight * value
-        weight_sum += weight
-    return [value / weight_sum for value in total]
-
-
-def scaled_quantile(p1: float, log_value: float) -> float:
-    """Exponentiate a log shape onto the anchor scale; overflow is non-finite."""
-    try:
-        return p1 * math.exp(log_value)
-    except OverflowError:
-        return math.inf
-
-
-def make_quantiles(value: float) -> float:
-    """Clamp a forecast quantile into the valid, finite output range."""
-    if not math.isfinite(value):
-        return MAX_Q
-    return min(MAX_Q, max(MIN_Q, value))
-
-
-def widen_outer_quantiles(quantiles: list[float]) -> list[float]:
-    """Stretch the outer levels away from the median on the log scale."""
-    # Widen q05/q95 to 1.2x their log distance from the median: this corrects the
-    # mild undercoverage of the empirical tails seen on 20+ launch comparisons.
-    if len(quantiles) < 5:
-        return list(quantiles)
-    q05, q50, q95 = quantiles[0], quantiles[2], quantiles[4]
-    if not all(math.isfinite(q) and q > 0.0 for q in (q05, q50, q95)):
-        return list(quantiles)
-    centre = math.log(q50)
-    widened = list(quantiles)
-    widened[0] = scaled_quantile(1.0, centre + 1.2 * (math.log(q05) - centre))
-    widened[4] = scaled_quantile(1.0, centre + 1.2 * (math.log(q95) - centre))
-    return widened
-
-
-def forecast(case: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    """Produce the 23-hour quantile forecast object for one case."""
-    raw_levels = case.get("levels")
-    levels = list(raw_levels) if isinstance(raw_levels, list) and len(raw_levels) == 5 else list(LEVELS)
-    levels = [float(t) if finite_number(t) is not None else LEVELS[i] for i, t in enumerate(levels)]
-    p1 = max(MIN_Q, anchor_viewers(case))
-    pool = build_pool(case)
-    raw = log_quantiles(pool, levels) if pool else {}
-    rows: list[dict[str, Any]] = []
-    for hour in HOURS:
-        if pool:
-            quantiles = [scaled_quantile(p1, x) for x in smooth(hour, raw, len(levels))]
-            if not all(math.isfinite(q) for q in quantiles):
-                quantiles = [scaled_quantile(p1, x) for x in house_log_shape(hour, len(levels))]
+        unlock = comp.get("unlock") if isinstance(comp.get("unlock"), str) else ""
+        w = 1.0
+        if "midnight local" in unlock and "rolling" in unlock:
+            w *= 2.0
+        h1 = curve[1]
+        # size similarity
+        if anchor > 0.0 and h1 > 0.0:
+            w *= math.exp(-abs(math.log(anchor) - math.log(h1)) / 0.8)
         else:
-            quantiles = [scaled_quantile(p1, x) for x in house_log_shape(hour, len(levels))]
-        quantiles = widen_outer_quantiles(quantiles)
-        quantiles = [make_quantiles(q) for q in quantiles]
-        for index in range(1, len(quantiles)):
-            quantiles[index] = max(quantiles[index], quantiles[index - 1])
-        rows.append({"hour": hour, "q": quantiles})
+            w = 0.0
+        members.append(PoolMember(curve, unlock, w))
+
+    if not members:
+        return []
+
+    kept = [m for m in members if m.weight > 1e-6]
+    if not kept:
+        # fall back to equal weights on all pool members
+        for m in members:
+            m.weight = 1.0
+        kept = members
+    return kept
+
+
+def weighted_quantile(values: list[tuple[float, float]], tau: float) -> float:
+    """First value where accumulated weight reaches tau's share (ascending)."""
+    if not values:
+        return 0.0
+    values.sort(key=lambda x: x[0])
+    total = sum(w for _, w in values)
+    if total <= 0.0:
+        return values[0][0]
+    target = tau * total
+    acc = 0.0
+    for v, w in values:
+        acc += w
+        if acc >= target - 1e-15:
+            return v
+    return values[-1][0]
+
+
+def house_log_baseline(hour: int) -> list[float]:
+    """House baseline log-shape quantiles for one hour."""
+    s = 0.15 * math.sqrt(hour - 1)
+    return [z * s for z in Z_HOUSE]
+
+
+def profile_quantiles(pool: list[PoolMember]) -> dict[int, list[float]]:
+    """Raw (unsmoothed) log-ratio quantiles per hour 2..24."""
+    raw: dict[int, list[float]] = {}
+    for h in HOURS:
+        samples: list[tuple[float, float]] = []
+        for m in pool:
+            vh = m.curve.get(h)
+            if vh is None or vh <= 0.0 or m.h1 <= 0.0:
+                continue
+            lr = math.log(vh / m.h1)
+            if math.isfinite(lr):
+                samples.append((lr, m.weight))
+        if samples:
+            raw[h] = [weighted_quantile(list(samples), tau) for tau in LEVELS]
+        else:
+            raw[h] = house_log_baseline(h)
+    return raw
+
+
+def smooth_profile(raw: dict[int, list[float]]) -> dict[int, list[float]]:
+    """Smooth 5 quantile series across neighbouring hours (weights 1,0.5,0.5)."""
+    smoothed: dict[int, list[float]] = {}
+    for h in HOURS:
+        out = [0.0] * 5
+        total_w = 0.0
+        for nh in (h - 1, h, h + 1):
+            if nh not in raw:
+                continue
+            dist = abs(nh - h)
+            w = 1.0 / (1.0 + dist)
+            vals = raw[nh]
+            for i in range(5):
+                out[i] += w * vals[i]
+            total_w += w
+        if total_w <= 0.0:
+            smoothed[h] = list(raw.get(h, house_log_baseline(h)))
+        else:
+            smoothed[h] = [x / total_w for x in out]
+    return smoothed
+
+
+def calibrate_and_scale(smoothed_q: list[float], anchor: float) -> list[float]:
+    """Apply calibration around median and exponentiate onto anchor scale."""
+    q05, q25, q50, q75, q95 = smoothed_q
+    m = q50
+    z05 = m + 0.9 * (q05 - m)
+    z25 = m + 0.8 * (q25 - m)
+    z50 = m
+    z75 = m + 1.2 * (q75 - m)
+    z95 = m + 0.9 * (q95 - m)
+    zs = [z05, z25, z50, z75, z95]
+    out: list[float] = []
+    for z in zs:
+        try:
+            val = anchor * math.exp(z)
+        except OverflowError:
+            val = math.inf
+        if not math.isfinite(val):
+            val = MAX_Q
+        val = max(MIN_Q, min(MAX_Q, val))
+        out.append(val)
+    # enforce non-decreasing
+    for i in range(1, len(out)):
+        if out[i] < out[i - 1]:
+            out[i] = out[i - 1]
+    return out
+
+
+def house_baseline_forecast(anchor: float) -> dict[str, Any]:
+    """Competition house baseline forecast for empty pool."""
+    rows = []
+    for h in HOURS:
+        s = 0.15 * math.sqrt(h - 1)
+        zs = [z * s for z in Z_HOUSE]
+        qs = calibrate_and_scale_from_z(zs, anchor)
+        rows.append({"hour": h, "q": qs})
     return {"hours": rows}
 
 
+def forecast_case(case: Any) -> dict[str, Any]:
+    """Produce forecast output for one case."""
+    if not isinstance(case, dict):
+        return house_baseline_forecast(1.0)
+    anchor = get_anchor(case)
+    if not (math.isfinite(anchor) and anchor >= 1.0):
+        anchor = 1.0
+    pool = build_pool(case, anchor)
+
+    if not pool:
+        return house_baseline_forecast(anchor)
+
+    raw = profile_quantiles(pool)
+    smoothed = smooth_profile(raw)
+    rows = []
+    for h in HOURS:
+        qs = calibrate_and_scale(smoothed[h], anchor)
+        rows.append({"hour": h, "q": qs})
+    return {"hours": rows}
+
+
+def calibrate_and_scale_from_z(zs: list[float], anchor: float) -> list[float]:
+    """Exponentiate given log quantiles and clamp/enforce monotonicity (fallback)."""
+    out: list[float] = []
+    for z in zs:
+        try:
+            val = anchor * math.exp(z)
+        except OverflowError:
+            val = math.inf
+        if not math.isfinite(val):
+            val = MAX_Q
+        val = max(MIN_Q, min(MAX_Q, val))
+        out.append(val)
+    for i in range(1, len(out)):
+        if out[i] < out[i - 1]:
+            out[i] = out[i - 1]
+    return out
+
+
 def main() -> None:
-    """Read every input case and write one JSON forecast per case."""
     input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
     output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(output_dir, exist_ok=True)
-    for filename in sorted(os.listdir(input_dir)):
-        if not filename.endswith(".in"):
+
+    try:
+        names = sorted(os.listdir(input_dir))
+    except OSError:
+        names = []
+
+    for name in names:
+        if not name.endswith(".in"):
             continue
+        in_path = os.path.join(input_dir, name)
+        case: Any = {}
         try:
-            with open(os.path.join(input_dir, filename), encoding="utf-8") as handle:
-                case = json.load(handle)
-        except (OSError, ValueError):
-            continue
-        if not isinstance(case, dict):
+            with open(in_path, "r", encoding="utf-8") as f:
+                case = json.load(f)
+        except (OSError, ValueError, json.JSONDecodeError):
             case = {}
-        case_id = case.get("id")
-        if not isinstance(case_id, str) or not case_id:
-            case_id = filename[:-3]
-        with open(os.path.join(output_dir, case_id + ".out"), "w", encoding="utf-8") as handle:
-            json.dump(forecast(case), handle, allow_nan=False)
+        if not isinstance(case, dict):
+            case_id = name[:-3]
+            case = {}
+        else:
+            case_id = case.get("id")
+            if not isinstance(case_id, str) or not case_id:
+                case_id = name[:-3]
+        result = forecast_case(case)
+        out_path = os.path.join(output_dir, case_id + ".out")
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, separators=(",", ":"))
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
